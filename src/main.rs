@@ -2,7 +2,10 @@
 
 mod evaluate;
 
-use evaluate::{evaluate, evaluate_plugin_metadata, read_load_order, EvalRequest};
+use evaluate::{
+    evaluate, evaluate_plugin_metadata, read_load_order, EvalRequest, GeneralMessageMinSeverity,
+    PluginMetadataContent,
+};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo},
@@ -14,7 +17,7 @@ use rmcp::{
 use serde::Serialize;
 use tokio::io::{stdin, stdout};
 
-const INSTRUCTIONS: &str = "LOOT/libloot read-only. loot_load_order reads loadorder.txt/plugins.txt from game_local_path (fast). load_order_use_libloadorder true = slow libloadorder scan. Full LOOT: loot_evaluate. Per-plugin YAML: loot_plugin_metadata.";
+const INSTRUCTIONS: &str = "LOOT/libloot read-only. loot_load_order reads loadorder.txt/plugins.txt from game_local_path (fast). load_order_use_libloadorder true = slow libloadorder scan. loot_evaluate: optional plugin_metadata_content problems (warn/error + incompatibilities), plugin_metadata_offset/limit pagination, include_master_header_issues, general_messages_min_severity. Per-plugin YAML or problems: loot_plugin_metadata (same args via flatten).";
 
 fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name)
@@ -34,6 +37,23 @@ fn or_env_str(arg: String, env_name: &str, fallback: &str) -> String {
         return t.to_string();
     }
     env_nonempty(env_name).unwrap_or_else(|| fallback.to_string())
+}
+
+#[derive(Debug, Default, serde::Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginMetadataContentArg {
+    #[default]
+    Full,
+    Problems,
+}
+
+#[derive(Debug, Default, serde::Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GeneralMessageMinSeverityArg {
+    #[default]
+    Say,
+    Warn,
+    Error,
 }
 
 #[derive(Debug, serde::Deserialize, JsonSchema)]
@@ -69,6 +89,24 @@ pub struct LootEvaluateArgs {
     #[schemars(description = "If true, include a `plugins` map with evaluated LOOT YAML per plugin (very large). Default false: load_order_current, load_order_suggested, general_messages only.")]
     #[serde(default)]
     pub include_plugin_metadata: bool,
+    #[schemars(description = "When include_plugin_metadata: full = metadata_yaml per plugin; problems = warn/error + incompatibilities (+ optional requirements/load_after), no YAML.")]
+    #[serde(default)]
+    pub plugin_metadata_content: PluginMetadataContentArg,
+    #[schemars(description = "When include_plugin_metadata: skip this many plugins from the start of load_order_current (stable order).")]
+    #[serde(default)]
+    pub plugin_metadata_offset: u32,
+    #[schemars(description = "When include_plugin_metadata: max plugins in `plugins` (omit for all from offset onward).")]
+    #[serde(default)]
+    pub plugin_metadata_limit: Option<u32>,
+    #[schemars(description = "Add master_header_issues: header masters missing from load order or not before dependent plugin.")]
+    #[serde(default)]
+    pub include_master_header_issues: bool,
+    #[schemars(description = "When plugin_metadata_content is problems: also include requirements and load_after file lists.")]
+    #[serde(default)]
+    pub plugin_problems_include_requirements_load_after: bool,
+    #[schemars(description = "Minimum severity for general_messages: say = all, warn = warn+error, error = errors only.")]
+    #[serde(default)]
+    pub general_messages_min_severity: GeneralMessageMinSeverityArg,
     #[schemars(description = "For loot_load_order: if true, use libloadorder (slow with many MO2 paths). Default false: read loadorder.txt or plugins.txt from game_local_path.")]
     #[serde(default)]
     pub load_order_use_libloadorder: bool,
@@ -96,6 +134,19 @@ fn merge_loot_eval_request(args: &LootEvaluateArgs) -> EvalRequest {
         additional_data_paths: args.additional_data_paths.clone(),
         mo2_mods_path: or_env_opt(args.mo2_mods_path.clone(), "LOOT_MCP_MO2_MODS_PATH"),
         include_plugin_metadata: args.include_plugin_metadata,
+        plugin_metadata_content: match args.plugin_metadata_content {
+            PluginMetadataContentArg::Full => PluginMetadataContent::Full,
+            PluginMetadataContentArg::Problems => PluginMetadataContent::Problems,
+        },
+        plugin_metadata_offset: args.plugin_metadata_offset,
+        plugin_metadata_limit: args.plugin_metadata_limit,
+        include_master_header_issues: args.include_master_header_issues,
+        plugin_problems_include_requirements_load_after: args.plugin_problems_include_requirements_load_after,
+        general_messages_min_severity: match args.general_messages_min_severity {
+            GeneralMessageMinSeverityArg::Say => GeneralMessageMinSeverity::Say,
+            GeneralMessageMinSeverityArg::Warn => GeneralMessageMinSeverity::Warn,
+            GeneralMessageMinSeverityArg::Error => GeneralMessageMinSeverity::Error,
+        },
         load_order_use_libloadorder: args.load_order_use_libloadorder,
     }
 }
@@ -115,7 +166,7 @@ impl LootServer {
 
     #[tool(
         name = "loot_evaluate",
-        description = "Read-only: libloot — suggested load order, general messages (default). Set include_plugin_metadata true for per-plugin evaluated YAML (heavy). Does not write plugins.txt."
+        description = "Read-only: libloot — suggested load order, general messages (default). include_plugin_metadata + plugin_metadata_content full|problems; plugin_metadata_offset/limit; include_master_header_issues; general_messages_min_severity. Does not write plugins.txt."
     )]
     async fn loot_evaluate(
         &self,
@@ -177,7 +228,7 @@ impl LootServer {
 
     #[tool(
         name = "loot_plugin_metadata",
-        description = "Evaluated LOOT YAML (masterlist+userlist) for named plugins only. Same paths as loot_evaluate; loads full load order internally but returns metadata just for plugin_names."
+        description = "Evaluated LOOT metadata for named plugins only. Same paths as loot_evaluate; use plugin_metadata_content problems for slices without full YAML."
     )]
     async fn loot_plugin_metadata(
         &self,

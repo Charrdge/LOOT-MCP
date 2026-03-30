@@ -1,11 +1,13 @@
 //! libloot evaluation (sync). Called from MCP tools via `spawn_blocking`.
 
 use anyhow::{anyhow, Result};
-use libloot::metadata::MessageContent;
-use libloot::{libloot_revision, libloot_version, EvalMode, Game, GameType, MergeMode};
+use libloot::metadata::{MessageContent, PluginMetadata};
+use libloot::{libloot_revision, libloot_version, EvalMode, Game, GameType, MergeMode, Plugin};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// After this, `load_plugin_headers` is done for the full current load order (needed for LOOT conditions).
 struct PreparedEval {
@@ -42,9 +44,46 @@ pub struct EvalRequest {
     /// If true, fill `plugins` with evaluated masterlist/userlist YAML per plugin (large payload). Default false: only load order, messages, and sorting.
     #[serde(default)]
     pub include_plugin_metadata: bool,
+    /// When `include_plugin_metadata` is true: `full` = `metadata_yaml` per plugin; `problems` = warn/error messages, incompatibilities, optional requirements/load_after (no YAML).
+    #[serde(default)]
+    pub plugin_metadata_content: PluginMetadataContent,
+    /// Skip this many plugins from the start of `load_order_current` when filling `plugins` (stable order).
+    #[serde(default)]
+    pub plugin_metadata_offset: u32,
+    /// Max plugins in `plugins` map; omit or `null` = all from offset to end.
+    #[serde(default)]
+    pub plugin_metadata_limit: Option<u32>,
+    /// If true, add `master_header_issues`: TES4 masters missing from load order or loaded after the dependent plugin.
+    #[serde(default)]
+    pub include_master_header_issues: bool,
+    /// In `problems` content mode, also emit `requirements` and `load_after` file lists (larger).
+    #[serde(default)]
+    pub plugin_problems_include_requirements_load_after: bool,
+    /// Filter `general_messages` by minimum severity (`say` = all, `warn` = warn+error, `error` = error only).
+    #[serde(default)]
+    pub general_messages_min_severity: GeneralMessageMinSeverity,
     /// For `loot_load_order`: if true, always use libloadorder (slow with many MO2 dirs). If false, read `loadorder.txt` / `plugins.txt` from `game_local_path` when present.
     #[serde(default)]
     pub load_order_use_libloadorder: bool,
+}
+
+/// How per-plugin LOOT metadata is exposed when `include_plugin_metadata` is true.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginMetadataContent {
+    #[default]
+    Full,
+    Problems,
+}
+
+/// Minimum severity included in `general_messages`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GeneralMessageMinSeverity {
+    #[default]
+    Say,
+    Warn,
+    Error,
 }
 
 #[derive(Debug, Serialize)]
@@ -60,6 +99,10 @@ pub struct EvalResponse {
     pub general_messages: Vec<MsgOut>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub plugins: BTreeMap<String, PluginOut>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub master_header_issues: Vec<MasterHeaderIssueOut>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_metadata_page: Option<PluginMetadataPageOut>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -97,7 +140,7 @@ pub struct LoadOrderReadResponse {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MsgOut {
     pub severity: String,
     pub text: String,
@@ -120,6 +163,44 @@ pub struct PluginOut {
     pub bash_tags_in_plugin_header: Vec<String>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub metadata_yaml: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata_problems: Option<PluginMetadataProblemsOut>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PluginMetadataProblemsOut {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<MsgOut>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub incompatibilities: Vec<FileRefOut>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub requirements: Vec<FileRefOut>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub load_after: Vec<FileRefOut>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FileRefOut {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MasterHeaderIssueOut {
+    pub plugin: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub missing_masters: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub masters_after_plugin: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PluginMetadataPageOut {
+    pub total: usize,
+    pub offset: usize,
+    pub returned: usize,
+    pub has_more: bool,
 }
 
 pub fn parse_game_type(s: &str) -> Result<GameType> {
@@ -355,6 +436,207 @@ fn message_severity(t: libloot::metadata::MessageType) -> &'static str {
     }
 }
 
+fn severity_str_rank(s: &str) -> u8 {
+    match s {
+        "warn" => 1,
+        "error" => 2,
+        _ => 0,
+    }
+}
+
+fn min_severity_rank(m: GeneralMessageMinSeverity) -> u8 {
+    match m {
+        GeneralMessageMinSeverity::Say => 0,
+        GeneralMessageMinSeverity::Warn => 1,
+        GeneralMessageMinSeverity::Error => 2,
+    }
+}
+
+fn filter_general_messages(msgs: Vec<MsgOut>, min: GeneralMessageMinSeverity) -> Vec<MsgOut> {
+    let r = min_severity_rank(min);
+    msgs
+        .into_iter()
+        .filter(|m| severity_str_rank(&m.severity) >= r)
+        .collect()
+}
+
+fn load_order_index_case_insensitive(current: &[String]) -> HashMap<String, usize> {
+    let mut m = HashMap::new();
+    for (i, name) in current.iter().enumerate() {
+        m.entry(name.to_ascii_lowercase()).or_insert(i);
+    }
+    m
+}
+
+fn collect_master_header_issues(game: &Game, current: &[String]) -> Vec<MasterHeaderIssueOut> {
+    let idx = load_order_index_case_insensitive(current);
+    let mut out = Vec::new();
+    for name in current {
+        let Some(p) = game.plugin(name) else {
+            continue;
+        };
+        let Ok(masters) = p.masters() else {
+            continue;
+        };
+        if masters.is_empty() {
+            continue;
+        }
+        let Some(&self_i) = idx.get(&name.to_ascii_lowercase()) else {
+            continue;
+        };
+        let mut missing_masters = Vec::new();
+        let mut masters_after_plugin = Vec::new();
+        for m in masters {
+            match idx.get(&m.to_ascii_lowercase()) {
+                None => missing_masters.push(m),
+                Some(&mi) if mi < self_i => {}
+                Some(_) => masters_after_plugin.push(m),
+            }
+        }
+        if missing_masters.is_empty() && masters_after_plugin.is_empty() {
+            continue;
+        }
+        out.push(MasterHeaderIssueOut {
+            plugin: name.clone(),
+            missing_masters,
+            masters_after_plugin,
+        });
+    }
+    out
+}
+
+fn file_to_out(f: &libloot::metadata::File) -> FileRefOut {
+    FileRefOut {
+        name: f.name().as_str().to_string(),
+        display_name: f.display_name().map(|s| s.to_string()),
+    }
+}
+
+fn problems_from_plugin_metadata(
+    meta: &PluginMetadata,
+    include_req_la: bool,
+) -> PluginMetadataProblemsOut {
+    use libloot::metadata::MessageType;
+    let messages: Vec<MsgOut> = meta
+        .messages()
+        .iter()
+        .filter(|m| matches!(m.message_type(), MessageType::Warn | MessageType::Error))
+        .map(|m| MsgOut {
+            severity: message_severity(m.message_type()).to_string(),
+            text: message_text(m),
+            condition: m.condition().map(|s| s.to_string()),
+        })
+        .collect();
+    let incompatibilities: Vec<FileRefOut> = meta.incompatibilities().iter().map(file_to_out).collect();
+    let (requirements, load_after) = if include_req_la {
+        (
+            meta.requirements().iter().map(file_to_out).collect(),
+            meta.load_after_files().iter().map(file_to_out).collect(),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    PluginMetadataProblemsOut {
+        messages,
+        incompatibilities,
+        requirements,
+        load_after,
+    }
+}
+
+fn problems_out_is_empty(p: &PluginMetadataProblemsOut) -> bool {
+    p.messages.is_empty()
+        && p.incompatibilities.is_empty()
+        && p.requirements.is_empty()
+        && p.load_after.is_empty()
+}
+
+fn get_evaluated_plugin_metadata(game: &Game, name: &str) -> Result<Option<PluginMetadata>, String> {
+    let db = game.database();
+    let db = db.read().map_err(|_| "LOOT database lock poisoned".to_string())?;
+    match db.plugin_metadata(name, MergeMode::WithUserMetadata, EvalMode::Evaluate) {
+        Ok(m) => Ok(m),
+        Err(e) => Err(format!("{:#}", e)),
+    }
+}
+
+fn plugin_names_page<'a>(
+    current: &'a [String],
+    offset: u32,
+    limit: Option<u32>,
+) -> Vec<&'a String> {
+    let off = offset as usize;
+    let it = current.iter().skip(off);
+    match limit {
+        None => it.collect(),
+        Some(0) => Vec::new(),
+        Some(l) => it.take(l as usize).collect(),
+    }
+}
+
+fn base_plugin_out(game: &Game, name: &str, p: &Arc<Plugin>) -> PluginOut {
+    PluginOut {
+        active: Some(game.is_plugin_active(name)),
+        version: p.version().map(|s| s.to_string()),
+        header_version: p.header_version(),
+        crc: p.crc(),
+        is_master: p.is_master(),
+        is_light: p.is_light_plugin(),
+        bash_tags_in_plugin_header: p.bash_tags().to_vec(),
+        metadata_yaml: String::new(),
+        metadata_problems: None,
+    }
+}
+
+fn fill_plugin_metadata_output(
+    game: &Game,
+    name: &str,
+    content: PluginMetadataContent,
+    include_req_la: bool,
+    mut base: PluginOut,
+) -> Result<Option<PluginOut>, anyhow::Error> {
+    match content {
+        PluginMetadataContent::Full => {
+            match get_evaluated_plugin_metadata(game, name) {
+                Ok(Some(m)) => {
+                    base.metadata_yaml = m.as_yaml();
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    base.metadata_yaml = format!("# metadata error: {}", e);
+                }
+            }
+            Ok(Some(base))
+        }
+        PluginMetadataContent::Problems => {
+            match get_evaluated_plugin_metadata(game, name) {
+                Ok(Some(m)) => {
+                    let prob = problems_from_plugin_metadata(&m, include_req_la);
+                    if problems_out_is_empty(&prob) {
+                        return Ok(None);
+                    }
+                    base.metadata_problems = Some(prob);
+                    Ok(Some(base))
+                }
+                Ok(None) => Ok(None),
+                Err(e) => {
+                    base.metadata_problems = Some(PluginMetadataProblemsOut {
+                        messages: vec![MsgOut {
+                            severity: "error".to_string(),
+                            text: format!("metadata error: {}", e),
+                            condition: None,
+                        }],
+                        incompatibilities: vec![],
+                        requirements: vec![],
+                        load_after: vec![],
+                    });
+                    Ok(Some(base))
+                }
+            }
+        }
+    }
+}
+
 pub fn read_load_order(req: EvalRequest) -> LoadOrderReadResponse {
     match run_read_load_order(req) {
         Ok(out) => out,
@@ -562,28 +844,16 @@ fn run_plugin_metadata(req: EvalRequest, plugin_names: Vec<String>) -> Result<Pl
             not_found.push(actual);
             continue;
         };
-        let meta_yaml = {
-            let db = game.database();
-            let db = db.read().map_err(|_| anyhow!("LOOT database lock poisoned"))?;
-            match db.plugin_metadata(&actual, MergeMode::WithUserMetadata, EvalMode::Evaluate) {
-                Ok(Some(m)) => m.as_yaml(),
-                Ok(None) => String::new(),
-                Err(e) => format!("# metadata error: {}", e),
-            }
-        };
-        plugins.insert(
-            actual,
-            PluginOut {
-                active: Some(game.is_plugin_active(p.name())),
-                version: p.version().map(|s| s.to_string()),
-                header_version: p.header_version(),
-                crc: p.crc(),
-                is_master: p.is_master(),
-                is_light: p.is_light_plugin(),
-                bash_tags_in_plugin_header: p.bash_tags().to_vec(),
-                metadata_yaml: meta_yaml,
-            },
-        );
+        let base = base_plugin_out(&game, &actual, &p);
+        if let Some(out) = fill_plugin_metadata_output(
+            &game,
+            &actual,
+            req.plugin_metadata_content,
+            req.plugin_problems_include_requirements_load_after,
+            base,
+        )? {
+            plugins.insert(actual, out);
+        }
     }
 
     Ok(PluginMetadataResponse {
@@ -741,6 +1011,8 @@ pub fn evaluate(req: EvalRequest) -> EvalResponse {
             load_order_ambiguous: None,
             general_messages: vec![],
             plugins: BTreeMap::new(),
+            master_header_issues: vec![],
+            plugin_metadata_page: None,
             error: Some(format!("{:#}", e)),
         },
     }
@@ -780,35 +1052,42 @@ fn run(req: EvalRequest) -> Result<EvalResponse> {
             condition: m.condition().map(|s| s.to_string()),
         })
         .collect();
+    let general_messages = filter_general_messages(general_messages, req.general_messages_min_severity);
+
+    let master_header_issues = if req.include_master_header_issues {
+        collect_master_header_issues(&game, &current)
+    } else {
+        vec![]
+    };
 
     let mut plugins = BTreeMap::new();
+    let mut plugin_metadata_page = None;
+
     if req.include_plugin_metadata {
-        for name in &current {
+        let total = current.len();
+        let offset = req.plugin_metadata_offset as usize;
+        let names = plugin_names_page(&current, req.plugin_metadata_offset, req.plugin_metadata_limit);
+        plugin_metadata_page = Some(PluginMetadataPageOut {
+            total,
+            offset,
+            returned: names.len(),
+            has_more: offset.saturating_add(names.len()) < total,
+        });
+
+        for name in names {
             let Some(p) = game.plugin(name) else {
                 continue;
             };
-            let meta_yaml = {
-                let db = game.database();
-                let db = db.read().map_err(|_| anyhow!("LOOT database lock poisoned"))?;
-                match db.plugin_metadata(name, MergeMode::WithUserMetadata, EvalMode::Evaluate) {
-                    Ok(Some(m)) => m.as_yaml(),
-                    Ok(None) => String::new(),
-                    Err(e) => format!("# metadata error: {}", e),
-                }
-            };
-            plugins.insert(
-                name.clone(),
-                PluginOut {
-                    active: Some(game.is_plugin_active(name)),
-                    version: p.version().map(|s| s.to_string()),
-                    header_version: p.header_version(),
-                    crc: p.crc(),
-                    is_master: p.is_master(),
-                    is_light: p.is_light_plugin(),
-                    bash_tags_in_plugin_header: p.bash_tags().to_vec(),
-                    metadata_yaml: meta_yaml,
-                },
-            );
+            let base = base_plugin_out(&game, name, &p);
+            if let Some(out) = fill_plugin_metadata_output(
+                &game,
+                name,
+                req.plugin_metadata_content,
+                req.plugin_problems_include_requirements_load_after,
+                base,
+            )? {
+                plugins.insert(name.clone(), out);
+            }
         }
     }
 
@@ -823,6 +1102,8 @@ fn run(req: EvalRequest) -> Result<EvalResponse> {
         load_order_ambiguous: Some(ambiguous),
         general_messages,
         plugins,
+        master_header_issues,
+        plugin_metadata_page,
         error: None,
     })
 }
@@ -900,5 +1181,43 @@ mod tests {
         let (v, src) = read_load_order_from_profile_dir(dir.path()).unwrap();
         assert_eq!(src, "plugins_txt");
         assert_eq!(v, vec!["m1.esp", "m2.esl"]);
+    }
+
+    #[test]
+    fn plugin_names_page_slice() {
+        let cur: Vec<String> = (0..5).map(|i| format!("p{i}.esp")).collect();
+        let a: Vec<_> = plugin_names_page(&cur, 0, None).into_iter().cloned().collect();
+        assert_eq!(a.len(), 5);
+        let b: Vec<_> = plugin_names_page(&cur, 2, Some(2)).into_iter().cloned().collect();
+        assert_eq!(b, vec!["p2.esp".to_string(), "p3.esp".to_string()]);
+        let c: Vec<_> = plugin_names_page(&cur, 4, Some(10)).into_iter().cloned().collect();
+        assert_eq!(c, vec!["p4.esp".to_string()]);
+        assert!(plugin_names_page(&cur, 0, Some(0)).is_empty());
+    }
+
+    #[test]
+    fn filter_general_messages_by_severity() {
+        let msgs = vec![
+            MsgOut {
+                severity: "say".to_string(),
+                text: "a".to_string(),
+                condition: None,
+            },
+            MsgOut {
+                severity: "warn".to_string(),
+                text: "b".to_string(),
+                condition: None,
+            },
+            MsgOut {
+                severity: "error".to_string(),
+                text: "c".to_string(),
+                condition: None,
+            },
+        ];
+        let w = filter_general_messages(msgs.clone(), GeneralMessageMinSeverity::Warn);
+        assert_eq!(w.len(), 2);
+        let e = filter_general_messages(msgs, GeneralMessageMinSeverity::Error);
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].severity, "error");
     }
 }
