@@ -3,19 +3,403 @@
 use anyhow::{anyhow, Result};
 use libloot::metadata::{MessageContent, PluginMetadata};
 use libloot::{libloot_revision, libloot_version, EvalMode, Game, GameType, MergeMode, Plugin};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::cell::RefCell;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+fn default_true() -> bool {
+    true
+}
 
 /// After this, `load_plugin_headers` is done for the full current load order (needed for LOOT conditions).
-struct PreparedEval {
-    game: Game,
-    current: Vec<String>,
-    masterlist_path_str: String,
-    prelude_loaded: bool,
-    userlist_loaded: bool,
+pub(crate) struct PreparedEval {
+    pub(crate) game: Game,
+    pub(crate) current: Vec<String>,
+    pub(crate) masterlist_path_str: String,
+    pub(crate) prelude_loaded: bool,
+    pub(crate) userlist_loaded: bool,
+}
+
+struct PrepCacheEntry {
+    key: PrepCacheKey,
+    prep: Arc<PreparedEval>,
+    cached_at: Instant,
+}
+
+static PREP_CACHE: Mutex<Option<PrepCacheEntry>> = Mutex::new(None);
+
+#[derive(Clone, PartialEq, Eq)]
+struct PrepCacheKey {
+    game_path: String,
+    game_local_path: String,
+    loot_data_path: String,
+    mo2_mods_path: String,
+    loot_game_folder: String,
+    additional_paths_sig: String,
+    masterlist_mtime: u64,
+    masterlist_len: u64,
+    userlist_mtime: u64,
+    userlist_len: u64,
+    loadorder_mtime: u64,
+    loadorder_len: u64,
+    plugins_mtime: u64,
+    plugins_len: u64,
+    modlist_mtime: u64,
+    modlist_len: u64,
+}
+
+fn system_time_secs(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn path_mtime(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map(system_time_secs)
+        .unwrap_or(0)
+}
+
+fn path_len_bytes(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+impl PrepCacheKey {
+    fn from_req(req: &EvalRequest) -> Result<Self> {
+        let gt = parse_game_type(&req.game_type)?;
+        let game_path = req.game_path.trim().to_string();
+        let game_local_path = req
+            .game_local_path
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        let loot_data_path = if let Some(ref p) = req.loot_data_path {
+            let p = p.trim();
+            if p.is_empty() {
+                default_loot_data_path()?.to_string_lossy().into_owned()
+            } else {
+                p.to_string()
+            }
+        } else {
+            default_loot_data_path()?.to_string_lossy().into_owned()
+        };
+        let mo2_mods_path = req
+            .mo2_mods_path
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        let loot_game_folder = req
+            .loot_game_folder
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| default_loot_folder(gt));
+        let additional_paths_sig = req
+            .additional_data_paths
+            .as_ref()
+            .map(|v| v.join("\x1e"))
+            .unwrap_or_default();
+
+        let loot_root = PathBuf::from(&loot_data_path);
+        let game_dir = resolve_game_loot_dir(&loot_root, &loot_game_folder);
+        let default_ml = game_dir.join("masterlist.yaml");
+        let masterlist = req
+            .masterlist_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or(default_ml);
+        let default_user = game_dir.join("userlist.yaml");
+        let userlist = req
+            .userlist_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or(default_user);
+
+        let profile = PathBuf::from(&game_local_path);
+        let loadorder = profile.join("loadorder.txt");
+        let plugins = profile.join("plugins.txt");
+        let modlist = profile.join("modlist.txt");
+
+        Ok(PrepCacheKey {
+            game_path,
+            game_local_path,
+            loot_data_path,
+            mo2_mods_path,
+            loot_game_folder,
+            additional_paths_sig,
+            masterlist_mtime: path_mtime(&masterlist),
+            masterlist_len: path_len_bytes(&masterlist),
+            userlist_mtime: if userlist.exists() {
+                path_mtime(&userlist)
+            } else {
+                0
+            },
+            userlist_len: if userlist.is_file() {
+                path_len_bytes(&userlist)
+            } else {
+                0
+            },
+            loadorder_mtime: if loadorder.is_file() {
+                path_mtime(&loadorder)
+            } else {
+                0
+            },
+            loadorder_len: if loadorder.is_file() {
+                path_len_bytes(&loadorder)
+            } else {
+                0
+            },
+            plugins_mtime: if plugins.is_file() {
+                path_mtime(&plugins)
+            } else {
+                0
+            },
+            plugins_len: if plugins.is_file() {
+                path_len_bytes(&plugins)
+            } else {
+                0
+            },
+            modlist_mtime: if modlist.is_file() {
+                path_mtime(&modlist)
+            } else {
+                0
+            },
+            modlist_len: if modlist.is_file() {
+                path_len_bytes(&modlist)
+            } else {
+                0
+            },
+        })
+    }
+}
+
+fn prep_cache_enabled() -> bool {
+    matches!(
+        std::env::var("LOOT_MCP_CACHE").ok().as_deref(),
+        Some("1") | Some("true")
+    )
+}
+
+/// Max age for a cached [`PreparedEval`]. `0` or unset = no TTL (until key changes or process exit).
+fn prep_cache_ttl() -> Option<std::time::Duration> {
+    let raw = std::env::var("LOOT_MCP_CACHE_TTL_SEC").ok()?;
+    let secs: u64 = raw.trim().parse().ok()?;
+    if secs == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_secs(secs))
+    }
+}
+
+fn prep_cache_entry_fresh(entry: &PrepCacheEntry, ttl: Option<std::time::Duration>) -> bool {
+    ttl.map(|d| entry.cached_at.elapsed() < d).unwrap_or(true)
+}
+
+fn timing_stderr_enabled() -> bool {
+    matches!(
+        std::env::var("LOOT_MCP_TIMING").ok().as_deref(),
+        Some("1") | Some("true")
+    )
+}
+
+fn timings_json_enabled() -> bool {
+    matches!(
+        std::env::var("LOOT_MCP_TIMINGS_JSON").ok().as_deref(),
+        Some("1") | Some("true")
+    )
+}
+
+fn diagnostics_log_path() -> Option<String> {
+    static PATH: OnceLock<Option<String>> = OnceLock::new();
+    PATH.get_or_init(|| {
+        std::env::var("LOOT_MCP_DIAGNOSTICS_LOG")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    })
+    .clone()
+}
+
+fn diagnostics_enabled() -> bool {
+    diagnostics_log_path().is_some()
+}
+
+static DIAG_LOG_WRITE_ERR: AtomicBool = AtomicBool::new(false);
+
+fn diagnostics_append_line(payload: &serde_json::Value) {
+    let Some(path) = diagnostics_log_path() else {
+        return;
+    };
+    let line = match serde_json::to_string(payload) {
+        Ok(s) => s,
+        Err(e) => {
+            if !DIAG_LOG_WRITE_ERR.swap(true, Ordering::SeqCst) {
+                eprintln!("loot-mcp diagnostics: serialize failed: {}", e);
+            }
+            return;
+        }
+    };
+    if let Err(e) = (|| -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        writeln!(f, "{}", line)?;
+        Ok(())
+    })() {
+        if !DIAG_LOG_WRITE_ERR.swap(true, Ordering::SeqCst) {
+            eprintln!("loot-mcp diagnostics: write {} failed: {}", path, e);
+        }
+    }
+}
+
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// Collect per-phase durations (ms) for JSON / diagnostics when stderr timing or TIMINGS_JSON is on.
+fn phase_timing_active() -> bool {
+    timing_stderr_enabled() || timings_json_enabled()
+}
+
+thread_local! {
+    static PHASE_TIMINGS: RefCell<Option<BTreeMap<String, u64>>> = RefCell::new(None);
+    static PREP_CACHE_TAG: RefCell<Option<String>> = RefCell::new(None);
+}
+
+fn phase_timings_begin() {
+    if phase_timing_active() {
+        PHASE_TIMINGS.with(|c| *c.borrow_mut() = Some(BTreeMap::new()));
+    }
+}
+
+fn phase_timings_take() -> BTreeMap<String, u64> {
+    PHASE_TIMINGS
+        .with(|c| c.borrow_mut().take())
+        .unwrap_or_default()
+}
+
+fn set_prep_cache_tag(tag: &str) {
+    PREP_CACHE_TAG.with(|c| *c.borrow_mut() = Some(tag.to_string()));
+}
+
+fn take_prep_cache_tag() -> Option<String> {
+    PREP_CACHE_TAG.with(|c| c.borrow_mut().take())
+}
+
+fn timed<T>(label: &'static str, f: impl FnOnce() -> T) -> T {
+    let stderr = timing_stderr_enabled();
+    let buf = PHASE_TIMINGS.with(|c| c.borrow().is_some());
+    if !stderr && !buf {
+        return f();
+    }
+    let t = Instant::now();
+    let out = f();
+    let ms = t.elapsed().as_millis() as u64;
+    if stderr {
+        eprintln!("loot-mcp timing: {} {:?}", label, t.elapsed());
+    }
+    if buf {
+        PHASE_TIMINGS.with(|c| {
+            if let Some(ref mut m) = *c.borrow_mut() {
+                m.insert(label.to_string(), ms);
+            }
+        });
+    }
+    out
+}
+
+fn timed_result<T>(label: &'static str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let stderr = timing_stderr_enabled();
+    let buf = PHASE_TIMINGS.with(|c| c.borrow().is_some());
+    if !stderr && !buf {
+        return f();
+    }
+    let t = Instant::now();
+    let out = f();
+    let ms = t.elapsed().as_millis() as u64;
+    if stderr {
+        eprintln!("loot-mcp timing: {} {:?}", label, t.elapsed());
+    }
+    if buf {
+        PHASE_TIMINGS.with(|c| {
+            if let Some(ref mut m) = *c.borrow_mut() {
+                m.insert(label.to_string(), ms);
+            }
+        });
+    }
+    out
+}
+
+fn parallel_metadata_enabled() -> bool {
+    std::env::var("LOOT_MCP_PARALLEL_METADATA").ok().as_deref() != Some("0")
+}
+
+pub(crate) fn get_or_load_prep(req: &EvalRequest) -> Result<Arc<PreparedEval>> {
+    if !prep_cache_enabled() {
+        set_prep_cache_tag("disabled");
+        return Ok(Arc::new(timed_result(
+            "prepare_eval_game_inner",
+            || prepare_eval_game_inner(req),
+        )?));
+    }
+    let key = PrepCacheKey::from_req(req)?;
+    let ttl = prep_cache_ttl();
+
+    {
+        let guard = PREP_CACHE.lock().map_err(|_| anyhow!("prep cache lock poisoned"))?;
+        if let Some(entry) = guard.as_ref() {
+            if entry.key == key && prep_cache_entry_fresh(entry, ttl) {
+                set_prep_cache_tag("hit");
+                if timing_stderr_enabled() {
+                    eprintln!("loot-mcp timing: prep_cache_hit");
+                }
+                return Ok(Arc::clone(&entry.prep));
+            }
+            if entry.key == key && ttl.is_some() && timing_stderr_enabled() {
+                eprintln!("loot-mcp timing: prep_cache_ttl_expired");
+            }
+        }
+    }
+
+    let prep = timed_result("prepare_eval_game_inner", || prepare_eval_game_inner(req))?;
+    let prep = Arc::new(prep);
+    let mut guard = PREP_CACHE.lock().map_err(|_| anyhow!("prep cache lock poisoned"))?;
+    if let Some(entry) = guard.as_ref() {
+        if entry.key == key && prep_cache_entry_fresh(entry, ttl) {
+            set_prep_cache_tag("hit");
+            if timing_stderr_enabled() {
+                eprintln!("loot-mcp timing: prep_cache_hit_race");
+            }
+            return Ok(Arc::clone(&entry.prep));
+        }
+    }
+    set_prep_cache_tag("miss");
+    if timing_stderr_enabled() {
+        eprintln!("loot-mcp timing: prep_cache_miss_store");
+    }
+    *guard = Some(PrepCacheEntry {
+        key,
+        prep: Arc::clone(&prep),
+        cached_at: Instant::now(),
+    });
+    Ok(prep)
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -62,6 +446,9 @@ pub struct EvalRequest {
     /// Filter `general_messages` by minimum severity (`say` = all, `warn` = warn+error, `error` = error only).
     #[serde(default)]
     pub general_messages_min_severity: GeneralMessageMinSeverity,
+    /// If false, skip `sort_plugins`; `load_order_suggested` is a copy of `load_order_current` (faster for large lists).
+    #[serde(default = "default_true")]
+    pub include_load_order_suggested: bool,
     /// For `loot_load_order`: if true, always use libloadorder (slow with many MO2 dirs). If false, read `loadorder.txt` / `plugins.txt` from `game_local_path` when present.
     #[serde(default)]
     pub load_order_use_libloadorder: bool,
@@ -86,6 +473,16 @@ pub enum GeneralMessageMinSeverity {
     Error,
 }
 
+/// Wall-clock and per-phase milliseconds (see `LOOT_MCP_TIMINGS_JSON`). `prep_cache` is set for tools that use prep (`hit` / `miss` / `disabled`).
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolTimingsOut {
+    pub total_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prep_cache: Option<String>,
+    #[serde(flatten)]
+    pub phases_ms: BTreeMap<String, u64>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct EvalResponse {
     pub libloot_version: String,
@@ -104,6 +501,10 @@ pub struct EvalResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plugin_metadata_page: Option<PluginMetadataPageOut>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub evaluate_note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timings: Option<ToolTimingsOut>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
@@ -121,6 +522,8 @@ pub struct PluginMetadataResponse {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub not_found: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub timings: Option<ToolTimingsOut>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
@@ -136,6 +539,8 @@ pub struct LoadOrderReadResponse {
     pub source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timings: Option<ToolTimingsOut>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -290,6 +695,39 @@ fn first_existing_plugin_file(dir: &Path, plugin_name: &str) -> Option<PathBuf> 
     None
 }
 
+/// Lowercase key for a flat plugin filename (handles `.esp.ghost` / `.esm.ghost` / `.esl.ghost`).
+fn plugin_file_index_key(file_name: &str) -> Option<String> {
+    let n = file_name.to_ascii_lowercase();
+    if n.ends_with(".esp.ghost") || n.ends_with(".esm.ghost") || n.ends_with(".esl.ghost") {
+        return Some(n[..n.len() - ".ghost".len()].to_string());
+    }
+    if n.ends_with(".esp") || n.ends_with(".esm") || n.ends_with(".esl") {
+        return Some(n);
+    }
+    None
+}
+
+/// Non-recursive: first-seen basename wins (MO2 `additional` order = high priority first).
+fn scan_flat_plugins_into_index(dir: &Path, index: &mut HashMap<String, PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let path = e.path();
+        if !path.is_file() {
+            continue;
+        }
+        let os_name = e.file_name();
+        let Some(fname) = os_name.to_str() else {
+            continue;
+        };
+        let Some(key) = plugin_file_index_key(fname) else {
+            continue;
+        };
+        index.entry(key).or_insert(path);
+    }
+}
+
 /// libloot resolves relative plugin paths only under main `Data/`; with MO2, files live under
 /// `additional_data_paths`. Pass absolute paths here so validation and loading match libloadorder.
 fn absolute_plugin_paths_for_libloot(
@@ -305,27 +743,48 @@ fn absolute_plugin_paths_for_libloot(
     let main = plugins_data_root(game_type, game_path);
     let additional = game.additional_data_paths();
 
-    load_order_names
-        .iter()
-        .map(|name| {
-            if matches!(game_type, GameType::Starfield) {
-                if first_existing_plugin_file(&main, name).is_none() {
-                    return main.join(name);
-                }
-            }
-
-            if matches!(game_type, GameType::OpenMW) {
-                return additional
+    if matches!(game_type, GameType::OpenMW) {
+        return load_order_names
+            .iter()
+            .map(|name| {
+                additional
                     .iter()
                     .rev()
                     .find_map(|d| first_existing_plugin_file(d, name))
-                    .unwrap_or_else(|| main.join(name));
-            }
+                    .unwrap_or_else(|| main.join(name))
+            })
+            .collect();
+    }
 
-            for dir in additional.iter() {
-                if let Some(p) = first_existing_plugin_file(dir, name) {
-                    return p;
+    if matches!(game_type, GameType::Starfield) {
+        return load_order_names
+            .iter()
+            .map(|name| {
+                if first_existing_plugin_file(&main, name).is_none() {
+                    return main.join(name);
                 }
+                for dir in additional.iter() {
+                    if let Some(p) = first_existing_plugin_file(dir, name) {
+                        return p;
+                    }
+                }
+                first_existing_plugin_file(&main, name).unwrap_or_else(|| main.join(name))
+            })
+            .collect();
+    }
+
+    let mut index: HashMap<String, PathBuf> = HashMap::new();
+    for dir in additional.iter() {
+        scan_flat_plugins_into_index(dir, &mut index);
+    }
+    scan_flat_plugins_into_index(&main, &mut index);
+
+    load_order_names
+        .iter()
+        .map(|name| {
+            let k = name.to_ascii_lowercase();
+            if let Some(p) = index.get(&k) {
+                return p.clone();
             }
             first_existing_plugin_file(&main, name).unwrap_or_else(|| main.join(name))
         })
@@ -638,16 +1097,78 @@ fn fill_plugin_metadata_output(
 }
 
 pub fn read_load_order(req: EvalRequest) -> LoadOrderReadResponse {
-    match run_read_load_order(req) {
-        Ok(out) => out,
-        Err(e) => LoadOrderReadResponse {
-            load_order: vec![],
-            load_order_ambiguous: None,
-            plugin_count: 0,
-            source: None,
-            note: None,
-            error: Some(format!("{:#}", e)),
-        },
+    let total_start = Instant::now();
+    let want_json = timings_json_enabled();
+    let want_diag = diagnostics_enabled();
+
+    if want_diag {
+        diagnostics_append_line(&serde_json::json!({
+            "ts_ms": now_ms(),
+            "event": "begin",
+            "tool": "loot_load_order",
+        }));
+    }
+
+    phase_timings_begin();
+
+    let result = timed_result("read_load_order", || run_read_load_order(req));
+    let phases = phase_timings_take();
+    let total_ms = total_start.elapsed().as_millis() as u64;
+
+    match result {
+        Ok(mut out) => {
+            if want_json {
+                out.timings = Some(ToolTimingsOut {
+                    total_ms,
+                    prep_cache: None,
+                    phases_ms: phases.clone(),
+                });
+            }
+            if want_diag {
+                diagnostics_append_line(&serde_json::json!({
+                    "ts_ms": now_ms(),
+                    "event": "end",
+                    "tool": "loot_load_order",
+                    "ok": true,
+                    "total_ms": total_ms,
+                    "phases_ms": phases,
+                    "plugin_count": out.plugin_count,
+                    "source": out.source,
+                }));
+            }
+            out
+        }
+        Err(e) => {
+            let err = format!("{:#}", e);
+            let mut out = LoadOrderReadResponse {
+                load_order: vec![],
+                load_order_ambiguous: None,
+                plugin_count: 0,
+                source: None,
+                note: None,
+                timings: None,
+                error: Some(err.clone()),
+            };
+            if want_json {
+                out.timings = Some(ToolTimingsOut {
+                    total_ms,
+                    prep_cache: None,
+                    phases_ms: phases.clone(),
+                });
+            }
+            if want_diag {
+                diagnostics_append_line(&serde_json::json!({
+                    "ts_ms": now_ms(),
+                    "event": "end",
+                    "tool": "loot_load_order",
+                    "ok": false,
+                    "total_ms": total_ms,
+                    "phases_ms": phases,
+                    "error": err,
+                }));
+            }
+            out
+        }
     }
 }
 
@@ -748,6 +1269,7 @@ fn run_read_load_order_via_libloadorder(req: &EvalRequest) -> Result<LoadOrderRe
         plugin_count,
         source: Some("libloadorder".to_string()),
         note: None,
+        timings: None,
         error: None,
     })
 }
@@ -780,6 +1302,7 @@ fn run_read_load_order(req: EvalRequest) -> Result<LoadOrderReadResponse> {
             note: Some(
                 "load_order_ambiguous is only computed when source is libloadorder".to_string(),
             ),
+            timings: None,
             error: None,
         });
     }
@@ -800,8 +1323,22 @@ fn resolve_plugin_name_in_load_order(current: &[String], requested: &str) -> Opt
 
 /// Evaluated masterlist/userlist YAML for specific plugins only (same game setup as `loot_evaluate`, no sort/messages).
 pub fn evaluate_plugin_metadata(req: EvalRequest, plugin_names: Vec<String>) -> PluginMetadataResponse {
-    match run_plugin_metadata(req, plugin_names) {
-        Ok(out) => out,
+    let total_start = Instant::now();
+    let want_json = timings_json_enabled();
+    let want_diag = diagnostics_enabled();
+
+    if want_diag {
+        diagnostics_append_line(&serde_json::json!({
+            "ts_ms": now_ms(),
+            "event": "begin",
+            "tool": "loot_plugin_metadata",
+        }));
+    }
+
+    phase_timings_begin();
+
+    let mut out = match run_plugin_metadata(req, plugin_names) {
+        Ok(o) => o,
         Err(e) => PluginMetadataResponse {
             libloot_version: libloot_version().to_string(),
             libloot_revision: libloot_revision().to_string(),
@@ -810,9 +1347,37 @@ pub fn evaluate_plugin_metadata(req: EvalRequest, plugin_names: Vec<String>) -> 
             userlist_loaded: false,
             plugins: BTreeMap::new(),
             not_found: vec![],
+            timings: None,
             error: Some(format!("{:#}", e)),
         },
+    };
+
+    let phases = phase_timings_take();
+    let total_ms = total_start.elapsed().as_millis() as u64;
+    let prep_cache = take_prep_cache_tag();
+
+    if want_json {
+        out.timings = Some(ToolTimingsOut {
+            total_ms,
+            prep_cache: prep_cache.clone(),
+            phases_ms: phases.clone(),
+        });
     }
+
+    if want_diag {
+        diagnostics_append_line(&serde_json::json!({
+            "ts_ms": now_ms(),
+            "event": "end",
+            "tool": "loot_plugin_metadata",
+            "ok": out.error.is_none(),
+            "total_ms": total_ms,
+            "prep_cache": prep_cache,
+            "phases_ms": phases,
+            "plugins_returned": out.plugins.len(),
+        }));
+    }
+
+    out
 }
 
 fn run_plugin_metadata(req: EvalRequest, plugin_names: Vec<String>) -> Result<PluginMetadataResponse> {
@@ -825,50 +1390,55 @@ fn run_plugin_metadata(req: EvalRequest, plugin_names: Vec<String>) -> Result<Pl
         return Err(anyhow!("plugin_names must contain at least one non-empty name"));
     }
 
-    let prep = prepare_eval_game(&req)?;
-    let game = prep.game;
+    let prep = get_or_load_prep(&req)?;
+    let game = &prep.game;
 
-    let mut seen = std::collections::BTreeSet::<String>::new();
-    let mut not_found = Vec::new();
-    let mut plugins = BTreeMap::new();
+    let (plugins, not_found) = timed_result("plugin_metadata_loop", || {
+        let mut seen = std::collections::BTreeSet::<String>::new();
+        let mut not_found = Vec::new();
+        let mut plugins = BTreeMap::new();
 
-    for requested in trimmed {
-        let Some(actual) = resolve_plugin_name_in_load_order(&prep.current, &requested) else {
-            not_found.push(requested);
-            continue;
-        };
-        if !seen.insert(actual.clone()) {
-            continue;
+        for requested in trimmed {
+            let Some(actual) = resolve_plugin_name_in_load_order(&prep.current, &requested) else {
+                not_found.push(requested);
+                continue;
+            };
+            if !seen.insert(actual.clone()) {
+                continue;
+            }
+            let Some(p) = game.plugin(&actual) else {
+                not_found.push(actual);
+                continue;
+            };
+            let base = base_plugin_out(game, &actual, &p);
+            if let Some(out) = fill_plugin_metadata_output(
+                game,
+                &actual,
+                req.plugin_metadata_content,
+                req.plugin_problems_include_requirements_load_after,
+                base,
+            )? {
+                plugins.insert(actual, out);
+            }
         }
-        let Some(p) = game.plugin(&actual) else {
-            not_found.push(actual);
-            continue;
-        };
-        let base = base_plugin_out(&game, &actual, &p);
-        if let Some(out) = fill_plugin_metadata_output(
-            &game,
-            &actual,
-            req.plugin_metadata_content,
-            req.plugin_problems_include_requirements_load_after,
-            base,
-        )? {
-            plugins.insert(actual, out);
-        }
-    }
+
+        Ok((plugins, not_found))
+    })?;
 
     Ok(PluginMetadataResponse {
         libloot_version: libloot_version().to_string(),
         libloot_revision: libloot_revision().to_string(),
-        masterlist_path: prep.masterlist_path_str,
+        masterlist_path: prep.masterlist_path_str.clone(),
         prelude_loaded: prep.prelude_loaded,
         userlist_loaded: prep.userlist_loaded,
         plugins,
         not_found,
+        timings: None,
         error: None,
     })
 }
 
-fn prepare_eval_game(req: &EvalRequest) -> Result<PreparedEval> {
+fn prepare_eval_game_inner(req: &EvalRequest) -> Result<PreparedEval> {
     let gt = parse_game_type(&req.game_type)?;
     let game_path = PathBuf::from(&req.game_path);
 
@@ -982,10 +1552,14 @@ fn prepare_eval_game(req: &EvalRequest) -> Result<PreparedEval> {
         ));
     }
 
-    let path_refs = absolute_plugin_paths_for_libloot(&game, gt, &game_path, &current);
+    let path_refs = timed("resolve_plugin_paths", || {
+        absolute_plugin_paths_for_libloot(&game, gt, &game_path, &current)
+    });
     let refs: Vec<&Path> = path_refs.iter().map(|p| p.as_path()).collect();
-    game.load_plugin_headers(&refs)
-        .map_err(|e| anyhow!("load_plugin_headers: {}", e))?;
+    timed_result("load_plugin_headers", || {
+        game.load_plugin_headers(&refs)
+            .map_err(|e| anyhow!("load_plugin_headers: {}", e))
+    })?;
 
     Ok(PreparedEval {
         game,
@@ -996,33 +1570,110 @@ fn prepare_eval_game(req: &EvalRequest) -> Result<PreparedEval> {
     })
 }
 
-/// Run LOOT evaluation. On failure returns `EvalResponse` with `error` set (for JSON + MCP isError).
-pub fn evaluate(req: EvalRequest) -> EvalResponse {
-    match run(req) {
-        Ok(out) => out,
-        Err(e) => EvalResponse {
-            libloot_version: libloot_version().to_string(),
-            libloot_revision: libloot_revision().to_string(),
-            masterlist_path: String::new(),
-            prelude_loaded: false,
-            userlist_loaded: false,
-            load_order_current: vec![],
-            load_order_suggested: vec![],
-            load_order_ambiguous: None,
-            general_messages: vec![],
-            plugins: BTreeMap::new(),
-            master_header_issues: vec![],
-            plugin_metadata_page: None,
-            error: Some(format!("{:#}", e)),
-        },
+fn empty_eval_response_error(msg: String) -> EvalResponse {
+    EvalResponse {
+        libloot_version: libloot_version().to_string(),
+        libloot_revision: libloot_revision().to_string(),
+        masterlist_path: String::new(),
+        prelude_loaded: false,
+        userlist_loaded: false,
+        load_order_current: vec![],
+        load_order_suggested: vec![],
+        load_order_ambiguous: None,
+        general_messages: vec![],
+        plugins: BTreeMap::new(),
+        master_header_issues: vec![],
+        plugin_metadata_page: None,
+        evaluate_note: None,
+        timings: None,
+        error: Some(msg),
     }
 }
 
-fn run(req: EvalRequest) -> Result<EvalResponse> {
-    let prep = prepare_eval_game(&req)?;
-    let game = prep.game;
-    let current = prep.current;
-    let masterlist_path_str = prep.masterlist_path_str;
+/// Run LOOT evaluation. On failure returns `EvalResponse` with `error` set (for JSON + MCP isError).
+pub fn evaluate(req: EvalRequest) -> EvalResponse {
+    let total_start = Instant::now();
+    let want_json = timings_json_enabled();
+    let want_diag = diagnostics_enabled();
+
+    if want_diag {
+        diagnostics_append_line(&serde_json::json!({
+            "ts_ms": now_ms(),
+            "event": "begin",
+            "tool": "loot_evaluate",
+        }));
+    }
+
+    phase_timings_begin();
+
+    let prep = match get_or_load_prep(&req) {
+        Ok(p) => p,
+        Err(e) => {
+            let mut resp = empty_eval_response_error(format!("{:#}", e));
+            let phases = phase_timings_take();
+            let total_ms = total_start.elapsed().as_millis() as u64;
+            let prep_cache = take_prep_cache_tag();
+            if want_json {
+                resp.timings = Some(ToolTimingsOut {
+                    total_ms,
+                    prep_cache: prep_cache.clone(),
+                    phases_ms: phases.clone(),
+                });
+            }
+            if want_diag {
+                diagnostics_append_line(&serde_json::json!({
+                    "ts_ms": now_ms(),
+                    "event": "end",
+                    "tool": "loot_evaluate",
+                    "ok": false,
+                    "total_ms": total_ms,
+                    "prep_cache": prep_cache,
+                    "phases_ms": phases,
+                    "error": resp.error.as_deref().unwrap_or(""),
+                }));
+            }
+            return resp;
+        }
+    };
+
+    let run_result = run(&prep, req);
+    let mut response = match run_result {
+        Ok(out) => out,
+        Err(e) => empty_eval_response_error(format!("{:#}", e)),
+    };
+
+    let phases = phase_timings_take();
+    let total_ms = total_start.elapsed().as_millis() as u64;
+    let prep_cache = take_prep_cache_tag();
+
+    if want_json {
+        response.timings = Some(ToolTimingsOut {
+            total_ms,
+            prep_cache: prep_cache.clone(),
+            phases_ms: phases.clone(),
+        });
+    }
+
+    if want_diag {
+        diagnostics_append_line(&serde_json::json!({
+            "ts_ms": now_ms(),
+            "event": "end",
+            "tool": "loot_evaluate",
+            "ok": response.error.is_none(),
+            "total_ms": total_ms,
+            "prep_cache": prep_cache,
+            "phases_ms": phases,
+            "plugin_count": response.load_order_current.len(),
+        }));
+    }
+
+    response
+}
+
+fn run(prep: &PreparedEval, req: EvalRequest) -> Result<EvalResponse> {
+    let game = &prep.game;
+    let current = prep.current.clone();
+    let masterlist_path_str = prep.masterlist_path_str.clone();
     let prelude_loaded = prep.prelude_loaded;
     let userlist_loaded = prep.userlist_loaded;
 
@@ -1030,19 +1681,31 @@ fn run(req: EvalRequest) -> Result<EvalResponse> {
         .is_load_order_ambiguous()
         .map_err(|e| anyhow!("is_load_order_ambiguous: {}", e))?;
 
-    let name_refs: Vec<&str> = current.iter().map(|s| s.as_str()).collect();
-    let suggested = game
-        .sort_plugins(&name_refs)
-        .map_err(|e| anyhow!("sort_plugins: {}", e))?;
+    let (load_order_suggested, evaluate_note) = if req.include_load_order_suggested {
+        let name_refs: Vec<&str> = current.iter().map(|s| s.as_str()).collect();
+        let suggested = timed_result("sort_plugins", || {
+            game.sort_plugins(&name_refs)
+                .map_err(|e| anyhow!("sort_plugins: {}", e))
+        })?;
+        (suggested, None)
+    } else {
+        (
+            current.clone(),
+            Some(
+                "load_order_suggested equals load_order_current; sort_plugins was skipped (include_load_order_suggested: false)."
+                    .to_string(),
+            ),
+        )
+    };
 
-    let gen = {
+    let gen = timed_result("general_messages", || {
         let db = game.database();
         let db = db
             .read()
             .map_err(|_| anyhow!("LOOT database lock poisoned"))?;
         db.general_messages(MergeMode::WithUserMetadata, EvalMode::Evaluate)
-            .map_err(|e| anyhow!("general_messages: {}", e))?
-    };
+            .map_err(|e| anyhow!("general_messages: {}", e))
+    })?;
 
     let general_messages: Vec<MsgOut> = gen
         .iter()
@@ -1074,19 +1737,47 @@ fn run(req: EvalRequest) -> Result<EvalResponse> {
             has_more: offset.saturating_add(names.len()) < total,
         });
 
-        for name in names {
-            let Some(p) = game.plugin(name) else {
-                continue;
-            };
-            let base = base_plugin_out(&game, name, &p);
-            if let Some(out) = fill_plugin_metadata_output(
-                &game,
-                name,
-                req.plugin_metadata_content,
-                req.plugin_problems_include_requirements_load_after,
-                base,
-            )? {
-                plugins.insert(name.clone(), out);
+        if parallel_metadata_enabled() {
+            let chunk: Vec<Result<Option<(String, PluginOut)>>> = timed("plugin_metadata_parallel", || {
+                names
+                    .par_iter()
+                    .map(|name_ref| {
+                        let name = name_ref.as_str().to_string();
+                        let Some(p) = game.plugin(name.as_str()) else {
+                            return Ok(None);
+                        };
+                        let base = base_plugin_out(game, name.as_str(), &p);
+                        let out = fill_plugin_metadata_output(
+                            game,
+                            name.as_str(),
+                            req.plugin_metadata_content,
+                            req.plugin_problems_include_requirements_load_after,
+                            base,
+                        )?;
+                        Ok(out.map(|o| (name, o)))
+                    })
+                    .collect()
+            });
+            for r in chunk {
+                if let Some((k, v)) = r? {
+                    plugins.insert(k, v);
+                }
+            }
+        } else {
+            for name in names {
+                let Some(p) = game.plugin(name) else {
+                    continue;
+                };
+                let base = base_plugin_out(game, name, &p);
+                if let Some(out) = fill_plugin_metadata_output(
+                    game,
+                    name,
+                    req.plugin_metadata_content,
+                    req.plugin_problems_include_requirements_load_after,
+                    base,
+                )? {
+                    plugins.insert(name.clone(), out);
+                }
             }
         }
     }
@@ -1098,12 +1789,14 @@ fn run(req: EvalRequest) -> Result<EvalResponse> {
         prelude_loaded,
         userlist_loaded,
         load_order_current: current,
-        load_order_suggested: suggested,
+        load_order_suggested,
         load_order_ambiguous: Some(ambiguous),
         general_messages,
         plugins,
         master_header_issues,
         plugin_metadata_page,
+        evaluate_note,
+        timings: None,
         error: None,
     })
 }
@@ -1112,6 +1805,7 @@ fn run(req: EvalRequest) -> Result<EvalResponse> {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::path::Path;
 
     #[test]
     fn parse_game_type_aliases() {
@@ -1193,6 +1887,35 @@ mod tests {
         let c: Vec<_> = plugin_names_page(&cur, 4, Some(10)).into_iter().cloned().collect();
         assert_eq!(c, vec!["p4.esp".to_string()]);
         assert!(plugin_names_page(&cur, 0, Some(0)).is_empty());
+    }
+
+    #[test]
+    fn plugin_index_first_scanned_root_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let high = dir.path().join("high");
+        let low = dir.path().join("low");
+        std::fs::create_dir_all(&high).unwrap();
+        std::fs::create_dir_all(&low).unwrap();
+        std::fs::write(high.join("Dup.esp"), []).unwrap();
+        std::fs::write(low.join("Dup.esp"), []).unwrap();
+        let mut idx = HashMap::new();
+        scan_flat_plugins_into_index(&high, &mut idx);
+        scan_flat_plugins_into_index(&low, &mut idx);
+        assert_eq!(
+            idx.get("dup.esp").map(|p| p.parent().map(Path::to_path_buf)),
+            Some(Some(high.clone()))
+        );
+    }
+
+    #[test]
+    fn plugin_index_ghost_maps_to_base_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("r");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Ghosty.esp.ghost"), []).unwrap();
+        let mut idx = HashMap::new();
+        scan_flat_plugins_into_index(&root, &mut idx);
+        assert!(idx.contains_key("ghosty.esp"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "loot-mcp"
-version = "0.2.0"
+version = "0.3.2"
 edition = "2021"
 description = "MCP server for LOOT/libloot (masterlist metadata, load order suggestion)"
 license = "MIT"
@@ -21,6 +21,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 libloot = "0.29"
+rayon = "1.10"
 schemars = "1"
 
 [dev-dependencies]

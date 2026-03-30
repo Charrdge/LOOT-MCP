@@ -17,7 +17,7 @@ use rmcp::{
 use serde::Serialize;
 use tokio::io::{stdin, stdout};
 
-const INSTRUCTIONS: &str = "LOOT/libloot read-only. loot_load_order reads loadorder.txt/plugins.txt from game_local_path (fast). load_order_use_libloadorder true = slow libloadorder scan. loot_evaluate: optional plugin_metadata_content problems (warn/error + incompatibilities), plugin_metadata_offset/limit pagination, include_master_header_issues, general_messages_min_severity. Per-plugin YAML or problems: loot_plugin_metadata (same args via flatten).";
+const INSTRUCTIONS: &str = "LOOT/libloot read-only. loot_load_order reads loadorder.txt/plugins.txt from game_local_path (fast). loot_evaluate: include_load_order_suggested false skips sort (faster). Prep cache (in-process): Docker defaults LOOT_MCP_CACHE=1; LOOT_MCP_CACHE=0 disables; LOOT_MCP_CACHE_TTL_SEC>0 TTL. Diagnostics: LOOT_MCP_TIMING=1 stderr phase timings; LOOT_MCP_TIMINGS_JSON=1 adds timings object (total_ms, prep_cache, per-phase ms) to tool JSON; LOOT_MCP_DIAGNOSTICS_LOG=/abs/path.ndjson append NDJSON begin/end (and errors). LOOT_MCP_PARALLEL_METADATA=0 disables parallel plugin metadata. Other: plugin_metadata_content problems, pagination, include_master_header_issues, general_messages_min_severity. loot_plugin_metadata: same base args (flatten).";
 
 fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name)
@@ -37,6 +37,10 @@ fn or_env_str(arg: String, env_name: &str, fallback: &str) -> String {
         return t.to_string();
     }
     env_nonempty(env_name).unwrap_or_else(|| fallback.to_string())
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Default, serde::Deserialize, JsonSchema)]
@@ -107,6 +111,9 @@ pub struct LootEvaluateArgs {
     #[schemars(description = "Minimum severity for general_messages: say = all, warn = warn+error, error = errors only.")]
     #[serde(default)]
     pub general_messages_min_severity: GeneralMessageMinSeverityArg,
+    #[schemars(description = "loot_evaluate only: if false, skip sort_plugins; load_order_suggested copies load_order_current (faster for huge lists).")]
+    #[serde(default = "default_true")]
+    pub include_load_order_suggested: bool,
     #[schemars(description = "For loot_load_order: if true, use libloadorder (slow with many MO2 paths). Default false: read loadorder.txt or plugins.txt from game_local_path.")]
     #[serde(default)]
     pub load_order_use_libloadorder: bool,
@@ -147,6 +154,7 @@ fn merge_loot_eval_request(args: &LootEvaluateArgs) -> EvalRequest {
             GeneralMessageMinSeverityArg::Warn => GeneralMessageMinSeverity::Warn,
             GeneralMessageMinSeverityArg::Error => GeneralMessageMinSeverity::Error,
         },
+        include_load_order_suggested: args.include_load_order_suggested,
         load_order_use_libloadorder: args.load_order_use_libloadorder,
     }
 }
@@ -166,7 +174,7 @@ impl LootServer {
 
     #[tool(
         name = "loot_evaluate",
-        description = "Read-only: libloot — suggested load order, general messages (default). include_plugin_metadata + plugin_metadata_content full|problems; plugin_metadata_offset/limit; include_master_header_issues; general_messages_min_severity. Does not write plugins.txt."
+        description = "Read-only: libloot — suggested load order, general messages (default). include_load_order_suggested false skips sort. include_plugin_metadata + plugin_metadata_content; pagination; include_master_header_issues; general_messages_min_severity. Env: LOOT_MCP_CACHE, LOOT_MCP_CACHE_TTL_SEC, LOOT_MCP_TIMING, LOOT_MCP_TIMINGS_JSON, LOOT_MCP_DIAGNOSTICS_LOG, LOOT_MCP_PARALLEL_METADATA=0. Does not write plugins.txt."
     )]
     async fn loot_evaluate(
         &self,
@@ -197,7 +205,7 @@ impl LootServer {
 
     #[tool(
         name = "loot_load_order",
-        description = "Read plugin load order from profile loadorder.txt or plugins.txt (fast, default). Falls back to libloadorder if those files are missing/empty. Set load_order_use_libloadorder true to force libloadorder (slow with many MO2 mod dirs). Requires game_local_path unless forcing libloadorder."
+        description = "Read plugin load order from profile loadorder.txt or plugins.txt (fast, default). Falls back to libloadorder if those files are missing/empty. Set load_order_use_libloadorder true to force libloadorder (slow with many MO2 mod dirs). Requires game_local_path unless forcing libloadorder. Env: LOOT_MCP_TIMING, LOOT_MCP_TIMINGS_JSON, LOOT_MCP_DIAGNOSTICS_LOG (same as loot_evaluate)."
     )]
     async fn loot_load_order(
         &self,
@@ -228,7 +236,7 @@ impl LootServer {
 
     #[tool(
         name = "loot_plugin_metadata",
-        description = "Evaluated LOOT metadata for named plugins only. Same paths as loot_evaluate; use plugin_metadata_content problems for slices without full YAML."
+        description = "Evaluated LOOT metadata for named plugins only. Same paths as loot_evaluate; use plugin_metadata_content problems for slices without full YAML. Env: LOOT_MCP_CACHE, LOOT_MCP_TIMING, LOOT_MCP_TIMINGS_JSON, LOOT_MCP_DIAGNOSTICS_LOG, LOOT_MCP_PARALLEL_METADATA=0."
     )]
     async fn loot_plugin_metadata(
         &self,
